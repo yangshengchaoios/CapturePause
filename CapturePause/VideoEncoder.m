@@ -10,77 +10,116 @@
 
 @implementation VideoEncoder
 
-@synthesize path = _path;
-
-+ (VideoEncoder*) encoderForPath:(NSString*) path Height:(int) cy width:(int) cx channels: (int) ch samples:(Float64) rate;
-{
-    VideoEncoder* enc = [VideoEncoder alloc];
-    [enc initPath:path Height:cy width:cx channels:ch samples:rate];
-    return enc;
-}
-
-
-- (void) initPath:(NSString*)path Height:(int) cy width:(int) cx channels: (int) ch samples:(Float64) rate;
-{
-    self.path = path;
+- (void) initWithPath:(NSString*)path outPutSize:(CGSize )size {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    }
+    NSURL* url = [NSURL fileURLWithPath:path];
     
-    [[NSFileManager defaultManager] removeItemAtPath:self.path error:nil];
-    NSURL* url = [NSURL fileURLWithPath:self.path];
+    //文件输出对象
+    _mediaWriter = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeQuickTimeMovie error:nil];
     
-    _writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeQuickTimeMovie error:nil];
-    NSDictionary* settings = [NSDictionary dictionaryWithObjectsAndKeys:
-                              AVVideoCodecH264, AVVideoCodecKey,
-                              [NSNumber numberWithInt: cx], AVVideoWidthKey,
-                              [NSNumber numberWithInt: cy], AVVideoHeightKey,
-                              nil];
-    _videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:settings];
-    _videoInput.expectsMediaDataInRealTime = YES;
-    [_writer addInput:_videoInput];
+    //设置video输出对象
+    NSDictionary *videoCompress = @{AVVideoAverageBitRateKey: @(512.0 * 1024.0)};
+    NSDictionary *videoSettings = [NSDictionary dictionaryWithObjectsAndKeys:
+                                   AVVideoCodecH264, AVVideoCodecKey,
+                                   [NSNumber numberWithInt:size.width], AVVideoWidthKey,
+                                   [NSNumber numberWithInt:size.height], AVVideoHeightKey,
+                                   AVVideoScalingModeResizeAspectFill, AVVideoScalingModeKey,
+                                   videoCompress, AVVideoCompressionPropertiesKey,
+                                   nil];
+    _videoWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+    NSParameterAssert(_videoWriterInput);
+    _videoWriterInput.expectsMediaDataInRealTime = YES;
+    //设置输出adaptor
+    NSDictionary *sourcePixelBufferAttributes = [NSDictionary dictionaryWithObjectsAndKeys:
+                                                 @(kCVPixelFormatType_32ARGB),kCVPixelBufferPixelFormatTypeKey,
+                                                 nil];
+    _adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:_videoWriterInput
+                                                                                sourcePixelBufferAttributes:sourcePixelBufferAttributes];
+    NSParameterAssert([_mediaWriter canAddInput:_videoWriterInput]);
     
-    settings = [NSDictionary dictionaryWithObjectsAndKeys:
-                                          [ NSNumber numberWithInt: kAudioFormatMPEG4AAC], AVFormatIDKey,
-                                          [ NSNumber numberWithInt: ch], AVNumberOfChannelsKey,
-                                          [ NSNumber numberWithFloat: rate], AVSampleRateKey,
-                                          [ NSNumber numberWithInt: 64000 ], AVEncoderBitRateKey,
-                nil];
-    _audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:settings];
-    _audioInput.expectsMediaDataInRealTime = YES;
-    [_writer addInput:_audioInput];
+    //设置audio输出对象
+    AudioChannelLayout acl;
+    bzero(&acl, sizeof(acl));
+    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+    NSDictionary *audioSettings = [NSDictionary dictionaryWithObjectsAndKeys:
+                                   @(kAudioFormatMPEG4AAC), AVFormatIDKey,
+                                   @(64000), AVEncoderBitRateKey,
+                                   @(44100), AVSampleRateKey,
+                                   @(1), AVNumberOfChannelsKey,
+                                   [NSData dataWithBytes:&acl length:sizeof(acl)], AVChannelLayoutKey,
+                                   nil];
+    _audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
+    NSParameterAssert(_audioWriterInput);
+    _audioWriterInput.expectsMediaDataInRealTime = YES;
+    NSParameterAssert([_mediaWriter canAddInput:_audioWriterInput]);
+    
+    //将video和audio两个输入对象加入文件输出对象
+    [_mediaWriter addInput:_videoWriterInput];
+    [_mediaWriter addInput:_audioWriterInput];
 }
 
 - (void) finishWithCompletionHandler:(void (^)(void))handler
 {
-    [_writer finishWritingWithCompletionHandler: handler];
+    [_videoWriterInput markAsFinished];
+    [_audioWriterInput markAsFinished];
+    [_mediaWriter finishWritingWithCompletionHandler: handler];
 }
+
+static CGFloat DegreesToRadians(CGFloat degrees) {return degrees * M_PI / 180;};
 
 - (BOOL) encodeFrame:(CMSampleBufferRef) sampleBuffer isVideo:(BOOL)bVideo
 {
     if (CMSampleBufferDataIsReady(sampleBuffer))
     {
-        if (_writer.status == AVAssetWriterStatusUnknown)
+        if (_mediaWriter.status == AVAssetWriterStatusUnknown)
         {
+            CGFloat rotationDegrees;
+            switch ([[UIDevice currentDevice] orientation]) {
+                case UIDeviceOrientationPortraitUpsideDown:
+                    rotationDegrees = -90.;
+                    break;
+                case UIDeviceOrientationLandscapeLeft: // no rotation
+                    rotationDegrees = 0.;
+                    break;
+                case UIDeviceOrientationLandscapeRight:
+                    rotationDegrees = 180.;
+                    break;
+                case UIDeviceOrientationPortrait:
+                case UIDeviceOrientationUnknown:
+                case UIDeviceOrientationFaceUp:
+                case UIDeviceOrientationFaceDown:
+                default:
+                    rotationDegrees = 90.;
+                    break;
+            }
+            CGFloat rotationRadians = DegreesToRadians(rotationDegrees);
+            [_videoWriterInput setTransform:CGAffineTransformMakeRotation(rotationRadians)];
+            
+            
             CMTime startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-            [_writer startWriting];
-            [_writer startSessionAtSourceTime:startTime];
+            [_mediaWriter startWriting];
+            [_mediaWriter startSessionAtSourceTime:startTime];
         }
-        if (_writer.status == AVAssetWriterStatusFailed)
+        if (_mediaWriter.status == AVAssetWriterStatusFailed)
         {
-            NSLog(@"writer error %@", _writer.error.localizedDescription);
+            NSLog(@"writer error %@", _mediaWriter.error.localizedDescription);
             return NO;
         }
         if (bVideo)
         {
-            if (_videoInput.readyForMoreMediaData == YES)
+            if (_videoWriterInput.readyForMoreMediaData)
             {
-                [_videoInput appendSampleBuffer:sampleBuffer];
+                [_videoWriterInput appendSampleBuffer:sampleBuffer];
                 return YES;
             }
         }
         else
         {
-            if (_audioInput.readyForMoreMediaData)
+            if (_audioWriterInput.readyForMoreMediaData)
             {
-                [_audioInput appendSampleBuffer:sampleBuffer];
+                [_audioWriterInput appendSampleBuffer:sampleBuffer];
                 return YES;
             }
         }

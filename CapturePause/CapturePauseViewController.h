@@ -15,5 +15,4 @@
 - (IBAction)startRecording:(id)sender;
 - (IBAction)pauseRecording:(id)sender;
 - (IBAction)stopRecording:(id)sender;
-- (IBAction)resumeRecording:(id)sender;
 @end

@@ -10,6 +10,9 @@
 #import "VideoEncoder.h"
 #import "AssetsLibrary/ALAssetsLibrary.h"
 
+#define VideoScreenWidth    640
+#define VideoScreenHeight   640
+
 static CameraEngine* theEngine;
 
 @interface CameraEngine  () <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
@@ -20,7 +23,7 @@ static CameraEngine* theEngine;
     AVCaptureConnection* _audioConnection;
     AVCaptureConnection* _videoConnection;
     
-    VideoEncoder* _encoder;
+    VideoEncoder *_encoder;
     BOOL _isCapturing;
     BOOL _isPaused;
     BOOL _discont;
@@ -34,8 +37,12 @@ static CameraEngine* theEngine;
     int _channels;
     Float64 _samplerate;
 }
-@end
 
+@property (nonatomic, assign) CMTime frameDuration;
+@property (nonatomic, assign) CMTime nextPTS;
+@property (nonatomic, strong) NSString *moveFilePath;
+
+@end
 
 @implementation CameraEngine
 
@@ -48,6 +55,7 @@ static CameraEngine* theEngine;
     if (self == [CameraEngine class])
     {
         theEngine = [[CameraEngine alloc] init];
+        [theEngine startup];
     }
 }
 
@@ -62,49 +70,63 @@ static CameraEngine* theEngine;
     {
         NSLog(@"Starting up server");
 
+        self.nextPTS = kCMTimeZero;
+        self.frameDuration = CMTimeMakeWithSeconds(1./24., 90000);
         self.isCapturing = NO;
         self.isPaused = NO;
         _currentFile = 0;
         _discont = NO;
+        _captureQueue = dispatch_queue_create("com.capturepause", DISPATCH_QUEUE_SERIAL);
         
-        // create capture device with video input
+        //1.0 初始化数据解析对象
+        NSString* filename = [NSString stringWithFormat:@"final_%ld.mp4", (long)[[NSDate date] timeIntervalSince1970]];
+        self.moveFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
+        NSLog(@"path = %@", self.moveFilePath);
+        _encoder = [[VideoEncoder alloc] init];
+        [_encoder initWithPath:self.moveFilePath outPutSize:CGSizeMake(VideoScreenWidth, VideoScreenHeight)];
+        
+        //2.0 初始化session
         _session = [[AVCaptureSession alloc] init];
-        AVCaptureDevice* backCamera = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-        AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:backCamera error:nil];
-        [_session addInput:input];
+        [_session beginConfiguration];
+        _session.sessionPreset = AVCaptureSessionPreset640x480;
         
-        // audio input from default mic
-        AVCaptureDevice* mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        AVCaptureDeviceInput* micinput = [AVCaptureDeviceInput deviceInputWithDevice:mic error:nil];
-        [_session addInput:micinput];
         
-        // create an output for YUV output with self as delegate
-        _captureQueue = dispatch_queue_create("uk.co.gdcl.cameraengine.capture", DISPATCH_QUEUE_SERIAL);
-        AVCaptureVideoDataOutput* videoout = [[AVCaptureVideoDataOutput alloc] init];
-        [videoout setSampleBufferDelegate:self queue:_captureQueue];
-        NSDictionary* setcapSettings = [NSDictionary dictionaryWithObjectsAndKeys:
-                                        [NSNumber numberWithInt:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange], kCVPixelBufferPixelFormatTypeKey,
-                                        nil];
-        videoout.videoSettings = setcapSettings;
-        [_session addOutput:videoout];
-        _videoConnection = [videoout connectionWithMediaType:AVMediaTypeVideo];
-        // find the actual dimensions used so we can set up the encoder to the same.
-        NSDictionary* actual = videoout.videoSettings;
-        _cy = [[actual objectForKey:@"Height"] integerValue];
-        _cx = [[actual objectForKey:@"Width"] integerValue];
+        //2.1 添加video输入设备
+        AVCaptureDevice *videoDevice = [self cameraWithPosition:AVCaptureDevicePositionBack];
+        AVCaptureDeviceInput *videoInput = [AVCaptureDeviceInput deviceInputWithDevice:videoDevice error:nil];
+        NSParameterAssert(videoInput);
+        NSParameterAssert([_session canAddInput:videoInput]);
+        [_session addInput:videoInput];
         
-        AVCaptureAudioDataOutput* audioout = [[AVCaptureAudioDataOutput alloc] init];
-        [audioout setSampleBufferDelegate:self queue:_captureQueue];
-        [_session addOutput:audioout];
-        _audioConnection = [audioout connectionWithMediaType:AVMediaTypeAudio];
-        // for audio, we want the channels and sample rate, but we can't get those from audioout.audiosettings on ios, so
-        // we need to wait for the first sample
+        //2.2. 添加audio输入设备
+        AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:nil];
+        NSParameterAssert(audioInput);
+        NSParameterAssert([_session canAddInput:audioInput]);
+        [_session addInput:audioInput];
         
-        // start capture and a preview layer
-        [_session startRunning];
-
+        //2.3. 创建video输出对象
+        AVCaptureVideoDataOutput* videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+        [videoOutput setSampleBufferDelegate:self queue:_captureQueue];
+        videoOutput.videoSettings = [NSDictionary dictionaryWithObjectsAndKeys:
+                                     @(kCVPixelFormatType_32BGRA), kCVPixelBufferPixelFormatTypeKey,
+                                     nil];
+        NSParameterAssert([_session canAddOutput:videoOutput]);
+        [_session addOutput:videoOutput];
+        _videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
+        
+        //2.4. 创建audio输出对象
+        AVCaptureAudioDataOutput* audioOutput = [[AVCaptureAudioDataOutput alloc] init];
+        [audioOutput setSampleBufferDelegate:self queue:_captureQueue];
+        NSParameterAssert([_session canAddOutput:audioOutput]);
+        [_session addOutput:audioOutput];
+        _audioConnection = [audioOutput connectionWithMediaType:AVMediaTypeAudio];
+        
+        //3.0 设置显示层并启动session
+        [_session commitConfiguration];
         _preview = [AVCaptureVideoPreviewLayer layerWithSession:_session];
         _preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        [_session startRunning];
     }
 }
 
@@ -117,7 +139,6 @@ static CameraEngine* theEngine;
             NSLog(@"starting capture");
             
             // create the encoder once we have the audio params
-            _encoder = nil;
             self.isPaused = NO;
             _discont = NO;
             _timeOffset = CMTimeMake(0, 0);
@@ -132,23 +153,16 @@ static CameraEngine* theEngine;
     {
         if (self.isCapturing)
         {
-            NSString* filename = [NSString stringWithFormat:@"capture%d.mp4", _currentFile];
-            NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
-            NSURL* url = [NSURL fileURLWithPath:path];
-            _currentFile++;
+            NSLog(@"stop capture");
             
+            [_session stopRunning];
+            _session = nil;
             // serialize with audio and video capture
             
             self.isCapturing = NO;
             dispatch_async(_captureQueue, ^{
                 [_encoder finishWithCompletionHandler:^{
-                    self.isCapturing = NO;
-                    _encoder = nil;
-                    ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
-                    [library writeVideoAtPathToSavedPhotosAlbum:url completionBlock:^(NSURL *assetURL, NSError *error){
-                        NSLog(@"save completed");
-                        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-                    }];
+                    
                 }];
             });
         }
@@ -180,135 +194,237 @@ static CameraEngine* theEngine;
     }
 }
 
-- (CMSampleBufferRef) adjustTime:(CMSampleBufferRef) sample by:(CMTime) offset
-{
-    CMItemCount count;
-    CMSampleBufferGetSampleTimingInfoArray(sample, 0, nil, &count);
-    CMSampleTimingInfo* pInfo = malloc(sizeof(CMSampleTimingInfo) * count);
-    CMSampleBufferGetSampleTimingInfoArray(sample, count, pInfo, &count);
-    for (CMItemCount i = 0; i < count; i++)
-    {
-        pInfo[i].decodeTimeStamp = CMTimeSubtract(pInfo[i].decodeTimeStamp, offset);
-        pInfo[i].presentationTimeStamp = CMTimeSubtract(pInfo[i].presentationTimeStamp, offset);
+- (void) reversalCamera {
+    @synchronized(self) {
+        NSArray *inputs = _session.inputs;
+        for ( AVCaptureDeviceInput *input in inputs ) {
+            AVCaptureDevice *device = input.device;
+            if ([device hasMediaType:AVMediaTypeVideo]) {
+                AVCaptureDevicePosition position = device.position;
+                AVCaptureDevice *newCamera = nil;
+                AVCaptureDeviceInput *newInput = nil;
+                
+                if (position == AVCaptureDevicePositionFront) {
+                    newCamera = [self cameraWithPosition:AVCaptureDevicePositionBack];
+                }
+                else {
+                    newCamera = [self cameraWithPosition:AVCaptureDevicePositionFront];
+                }
+                newInput = [AVCaptureDeviceInput deviceInputWithDevice:newCamera error:nil];
+                
+                // beginConfiguration ensures that pending changes are not applied immediately
+                [_session beginConfiguration];
+                
+                [_session removeInput:input];
+                [_session addInput:newInput];
+                
+                // Changes take effect once the outermost commitConfiguration is invoked.
+                [_session commitConfiguration];
+                break;
+            }
+        }
     }
-    CMSampleBufferRef sout;
-    CMSampleBufferCreateCopyWithNewTiming(nil, sample, count, pInfo, &sout);
-    free(pInfo);
-    return sout;
-}
-
-- (void) setAudioFormat:(CMFormatDescriptionRef) fmt
-{
-    const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
-    _samplerate = asbd->mSampleRate;
-    _channels = asbd->mChannelsPerFrame;
-    
 }
 
 - (void) captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
 {
-    BOOL bVideo = YES;
+    if ( ! self.isCapturing || self.isPaused) {
+        NSLog(@"is paused!");
+        return;
+    }
     
-    @synchronized(self)
-    {
-        if (!self.isCapturing  || self.isPaused)
-        {
-            return;
-        }
-        if (connection != _videoConnection)
-        {
-            bVideo = NO;
-        }
-        if ((_encoder == nil) && !bVideo)
-        {
-            CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
-            [self setAudioFormat:fmt];
-            NSString* filename = [NSString stringWithFormat:@"capture%d.mp4", _currentFile];
-            NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
-            _encoder = [VideoEncoder encoderForPath:path Height:_cy width:_cx channels:_channels samples:_samplerate];
-        }
-        if (_discont)
-        {
-            if (bVideo)
-            {
-                return;
-            }
-            _discont = NO;
-            // calc adjustment
-            CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-            CMTime last = bVideo ? _lastVideo : _lastAudio;
-            if (last.flags & kCMTimeFlags_Valid)
-            {
-                if (_timeOffset.flags & kCMTimeFlags_Valid)
-                {
-                    pts = CMTimeSubtract(pts, _timeOffset);
-                }
-                CMTime offset = CMTimeSubtract(pts, last);
-                NSLog(@"Setting offset from %s", bVideo?"video": "audio");
-                NSLog(@"Adding %f to %f (pts %f)", ((double)offset.value)/offset.timescale, ((double)_timeOffset.value)/_timeOffset.timescale, ((double)pts.value/pts.timescale));
-                
-                // this stops us having to set a scale for _timeOffset before we see the first video time
-                if (_timeOffset.value == 0)
-                {
-                    _timeOffset = offset;
-                }
-                else
-                {
-                    _timeOffset = CMTimeAdd(_timeOffset, offset);
-                }
-            }
-            _lastVideo.flags = 0;
-            _lastAudio.flags = 0;
-        }
+    NSLog(@"sample buffer data is arrived");
+    
+    if (connection == _videoConnection) {
+        NSLog(@"is video");
         
-        // retain so that we can release either this or modified one
-        CFRetain(sampleBuffer);
+//        CMSampleTimingInfo timingInfo = kCMTimingInfoInvalid;
+//        timingInfo.duration = self.frameDuration;
+//        timingInfo.presentationTimeStamp = self.nextPTS;
+//        CMSampleBufferRef sbufWithNewTiming = NULL;
+//        
+//        
+//        OSStatus err = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault,
+//                                                             sampleBuffer,
+//                                                             1,
+//                                                             &timingInfo,
+//                                                             &sbufWithNewTiming);
+//        if (err) {
+//            NSLog(@"CMSampleBufferCreateCopyWithNewTiming error");
+//            return;
+//        }
         
-        if (_timeOffset.value > 0)
-        {
-            CFRelease(sampleBuffer);
-            sampleBuffer = [self adjustTime:sampleBuffer by:_timeOffset];
-        }
-        
-        // record most recent time so we know the length of the pause
-        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
-        if (dur.value > 0)
-        {
-            pts = CMTimeAdd(pts, dur);
-        }
-        if (bVideo)
-        {
-            _lastVideo = pts;
-        }
-        else
-        {
-            _lastAudio = pts;
-        }
+        [_encoder encodeFrame:sampleBuffer isVideo:YES];
+        self.nextPTS = CMTimeAdd(self.frameDuration, self.nextPTS);
     }
-
-    // pass frame to encoder
-    [_encoder encodeFrame:sampleBuffer isVideo:bVideo];
-    CFRelease(sampleBuffer);
+    else {
+        NSLog(@"is audio");
+        
+        [_encoder encodeFrame:sampleBuffer isVideo:NO];
+    }
 }
 
-- (void) shutdown
-{
-    NSLog(@"shutting down server");
-    if (_session)
-    {
-        [_session stopRunning];
-        _session = nil;
-    }
-    [_encoder finishWithCompletionHandler:^{
-        NSLog(@"Capture completed");
-    }];
+- (void)captureOutput:(AVCaptureOutput *)captureOutput didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
+    
 }
-
 
 - (AVCaptureVideoPreviewLayer*) getPreviewLayer
 {
     return _preview;
+}
+
+#pragma mark - 私有方法
+
+- (AVCaptureDevice *)cameraWithPosition:(AVCaptureDevicePosition) position
+{
+    __block AVCaptureDevice *foundDevice = nil;
+    
+    [[AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo] enumerateObjectsUsingBlock:^(AVCaptureDevice *device, NSUInteger idx, BOOL *stop) {
+        
+        if (device.position == position)
+        {
+            foundDevice = device;
+            *stop = YES;
+        }
+        
+    }];
+    
+    return foundDevice;
+}
+
+- (void)convertToMp4 {
+//    NSString* _mp4Quality = AVAssetExportPresetMediumQuality;
+//    
+//    // 试图删除原mp4
+//    if ([[NSFileManager defaultManager] fileExistsAtPath:self.moveFilePath]) {
+//        [[NSFileManager defaultManager] removeItemAtURL:[NSURL URLWithString:self.moveFilePath] error:nil];
+//    }
+//    
+//    // 生成mp4
+//    AVURLAsset *avAsset = [AVURLAsset URLAssetWithURL:self.outputMovURL options:nil];
+//    NSArray *compatiblePresets = [AVAssetExportSession exportPresetsCompatibleWithAsset:avAsset];
+//    
+//    if ([compatiblePresets containsObject:_mp4Quality]) {
+//        __block AVAssetExportSession *exportSession = [[AVAssetExportSession alloc]initWithAsset:avAsset
+//                                                                                      presetName:_mp4Quality];
+//        
+//        exportSession.outputURL = self.outputMp4URL;
+//        exportSession.outputFileType = AVFileTypeMPEG4;
+//        [exportSession exportAsynchronouslyWithCompletionHandler:^{
+//            [blockSelf hideHUDLoading];
+//            switch ([exportSession status]) {
+//                case AVAssetExportSessionStatusFailed:
+//                    [blockSelf showResultThenHide:@"转换mp4出错"];
+//                    break;
+//                case AVAssetExportSessionStatusCancelled:
+//                    [blockSelf showResultThenHide:@"转换被取消"];
+//                    break;
+//                case AVAssetExportSessionStatusCompleted:
+//                    [blockSelf performSelectorOnMainThread:@selector(convertFinish) withObject:nil waitUntilDone:NO];
+//                    break;
+//                default:
+//                    break;
+//            }
+//        }];
+//    }
+//    else {
+//        [self hideHUDLoading];
+//        [self showResultThenHide:@"转换mp4出错！"];
+//    }
+}
+
+// 通过抽样缓存数据创建一个UIImage对象
+- (UIImage *) imageFromSampleBuffer:(CMSampleBufferRef) sampleBuffer
+{
+    // 为媒体数据设置一个CMSampleBuffer的Core Video图像缓存对象
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    // 锁定pixel buffer的基地址
+    CVPixelBufferLockBaseAddress(imageBuffer, 0);
+    
+    // 得到pixel buffer的基地址
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+    
+    // 得到pixel buffer的行字节数
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    // 得到pixel buffer的宽和高
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    
+    // 创建一个依赖于设备的RGB颜色空间
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    
+    // 用抽样缓存的数据创建一个位图格式的图形上下文（graphics context）对象
+    CGContextRef context = CGBitmapContextCreate(baseAddress, width, height, 8,
+                                                 bytesPerRow, colorSpace, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    // 根据这个位图context中的像素数据创建一个Quartz image对象
+    CGImageRef quartzImage = CGBitmapContextCreateImage(context);
+    // 解锁pixel buffer
+    CVPixelBufferUnlockBaseAddress(imageBuffer,0);
+    
+    // 释放context和颜色空间
+    CGContextRelease(context);
+    CGColorSpaceRelease(colorSpace);
+    
+    // 用Quartz image创建一个UIImage对象image
+    UIImage *image = [UIImage imageWithCGImage:quartzImage];
+    
+    // 释放Quartz image对象
+    CGImageRelease(quartzImage);
+    
+    return (image);  
+}
+
+- (UIImage *) imageFromSampleBuffer1:(CMSampleBufferRef) sampleBuffer
+{
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    // Lock the base address of the pixel buffer
+    CVPixelBufferLockBaseAddress(imageBuffer,0);
+    
+    // Get the number of bytes per row for the pixel buffer
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    // Get the pixel buffer width and height
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    
+    // Create a device-dependent RGB color space
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    if (!colorSpace)
+    {
+        NSLog(@"CGColorSpaceCreateDeviceRGB failure");
+        return nil;
+    }
+    
+    // Get the base address of the pixel buffer
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+    // Get the data size for contiguous planes of the pixel buffer.
+    size_t bufferSize = CVPixelBufferGetDataSize(imageBuffer);
+    
+    // Create a Quartz direct-access data provider that uses data we supply
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, baseAddress, bufferSize,
+                                                              NULL);
+    // Create a bitmap image from data supplied by our data provider
+    CGImageRef cgImage = CGImageCreate(width,
+                                       height,
+                                       8,
+                                       32,
+                                       bytesPerRow,
+                                       colorSpace,
+                                       kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+                                       provider,
+                                       NULL,
+                                       true,
+                                       kCGRenderingIntentDefault);
+    
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(colorSpace);
+    
+    // Create and return an image object representing the specified Quartz image
+    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage);
+    
+    CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+    
+    return image;
 }
 
 @end

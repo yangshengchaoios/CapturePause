@@ -15,17 +15,13 @@
 
 @interface VideoEncoder : NSObject
 {
-    AVAssetWriter* _writer;
-    AVAssetWriterInput* _videoInput;
-    AVAssetWriterInput* _audioInput;
-    NSString* _path;
+    AVAssetWriter* _mediaWriter;
+    AVAssetWriterInput* _videoWriterInput;
+    AVAssetWriterInput* _audioWriterInput;
+    AVAssetWriterInputPixelBufferAdaptor *_adaptor;
 }
 
-@property NSString* path;
-
-+ (VideoEncoder*) encoderForPath:(NSString*) path Height:(int) cy width:(int) cx channels: (int) ch samples:(Float64) rate;
-
-- (void) initPath:(NSString*)path Height:(int) cy width:(int) cx channels: (int) ch samples:(Float64) rate;
+- (void) initWithPath:(NSString*)path outPutSize:(CGSize )size;
 - (void) finishWithCompletionHandler:(void (^)(void))handler;
 - (BOOL) encodeFrame:(CMSampleBufferRef) sampleBuffer isVideo:(BOOL) bVideo;
 

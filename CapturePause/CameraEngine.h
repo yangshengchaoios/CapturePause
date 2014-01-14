@@ -17,14 +17,13 @@
 @interface CameraEngine : NSObject
 
 + (CameraEngine*) engine;
-- (void) startup;
-- (void) shutdown;
 - (AVCaptureVideoPreviewLayer*) getPreviewLayer;
 
 - (void) startCapture;
 - (void) pauseCapture;
 - (void) stopCapture;
 - (void) resumeCapture;
+- (void) reversalCamera;
 
 @property (atomic, readwrite) BOOL isCapturing;
 @property (atomic, readwrite) BOOL isPaused;

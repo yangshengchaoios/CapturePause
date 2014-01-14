@@ -11,6 +11,11 @@
 
 @interface CapturePauseViewController ()
 
+@property (nonatomic, weak) IBOutlet UIButton *controlButton;
+@property (nonatomic, weak) IBOutlet UIButton *stopButton;
+@property (nonatomic, weak) IBOutlet UIButton *reversalButton;
+@property (nonatomic, assign) BOOL isStarted;
+
 @end
 
 @implementation CapturePauseViewController
@@ -21,6 +26,17 @@
 {
     [super viewDidLoad];
     [self startPreview];
+    
+    self.isStarted = NO;
+    [self.controlButton setTitle:@"highlighted" forState:UIControlStateHighlighted];
+    [self.controlButton setTitle:@"normal" forState:UIControlStateNormal];
+    [self.controlButton addTarget:self action:@selector(startRecording:) forControlEvents:UIControlEventTouchDown];
+    [self.controlButton addTarget:self action:@selector(startRecording:) forControlEvents:UIControlEventTouchDragEnter];
+    [self.controlButton addTarget:self action:@selector(pauseRecording:) forControlEvents:UIControlEventTouchUpInside];
+    [self.controlButton addTarget:self action:@selector(pauseRecording:) forControlEvents:UIControlEventTouchDragExit];
+    
+    [self.stopButton addTarget:self action:@selector(stopRecording:) forControlEvents:UIControlEventTouchUpInside];
+    [self.reversalButton addTarget:self action:@selector(reversalButtonClicked:) forControlEvents:UIControlEventTouchUpInside];
 }
 
 - (void) startPreview
@@ -28,28 +44,20 @@
     AVCaptureVideoPreviewLayer* preview = [[CameraEngine engine] getPreviewLayer];
     [preview removeFromSuperlayer];
     preview.frame = self.cameraView.bounds;
-    [[preview connection] setVideoOrientation:UIInterfaceOrientationLandscapeRight];
+//    [[preview connection] setVideoOrientation:AVCaptureVideoOrientationPortrait];
     
     [self.cameraView.layer addSublayer:preview];
 }
 
-- (void) willAnimateRotationToInterfaceOrientation:(UIInterfaceOrientation)toInterfaceOrientation duration:(NSTimeInterval)duration
-{
-    // this is not the most beautiful animation...
-    AVCaptureVideoPreviewLayer* preview = [[CameraEngine engine] getPreviewLayer];
-    preview.frame = self.cameraView.bounds;
-    [[preview connection] setVideoOrientation:toInterfaceOrientation];
-}
-
-- (void)didReceiveMemoryWarning
-{
-    [super didReceiveMemoryWarning];
-    // Dispose of any resources that can be recreated.
-}
-
 - (IBAction)startRecording:(id)sender
 {
-    [[CameraEngine engine] startCapture];
+    if ( ! self.isStarted) {
+        self.isStarted = YES;
+        [[CameraEngine engine] startCapture];
+    }
+    else {
+        [[CameraEngine engine] resumeCapture];
+    }
 }
 
 - (IBAction)pauseRecording:(id)sender
@@ -59,11 +67,12 @@
 
 - (IBAction)stopRecording:(id)sender
 {
+    self.isStarted = NO;
     [[CameraEngine engine] stopCapture];
 }
-- (IBAction)resumeRecording:(id)sender
-{
-    [[CameraEngine engine] resumeCapture];
+
+- (IBAction)reversalButtonClicked:(id)sender {
+    [[CameraEngine engine] reversalCamera];
 }
 
 @end
